@@ -1,2 +1,6 @@
 *.swp
 *.swo
+docs/build
+build
+tags
+compile_commands.json
