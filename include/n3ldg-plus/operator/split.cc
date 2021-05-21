@@ -2,7 +2,11 @@
 
 using std::string;
 using std::cerr;
+using std::cout;
+using std::endl;
 using std::vector;
+using std::pair;
+using std::make_pair;
 
 namespace n3ldg_plus {
 
@@ -12,10 +16,6 @@ public:
 
     void setNodeDim(int dim) override {
         setDim(dim);
-    }
-
-    void initNode(int dim) override {
-        init(dim);
     }
 
     string typeSignature() const override {
@@ -37,23 +37,31 @@ public:
 
     void compute () override {
         int row = getDim() / getColumn();
-        int in_row = getInput().getDim() / getColumn();
+        int in_row = inputDim() / getColumn();
         for (int i = 0; i < getColumn(); ++i) {
-            Vec(val().v + i * row, row) = Vec(getInput().getVal().v + i * in_row + offset_, row);
+            Vec(val().v + i * row, row) = Vec(inputVal().v + i * in_row + offset_, row);
         }
     }
 
     void backward() override {
         int row = getDim() / getColumn();
-        int in_row = getInput().getDim() / getColumn();
+        int in_row = inputDim() / getColumn();
         for (int i = 0; i < getColumn(); ++i) {
-            Vec(getInput().loss().v + i * in_row + offset_, row) +=
-                Vec(getLoss().v + i * row, row);
+            Vec(inputGrad().v + i * in_row + offset_, row) += Vec(getGrad().v + i * row, row);
         }
     }
+
 protected:
     virtual bool isDimLegal(const Node &input) const override {
         return offset_ + getDim() <= input.getDim();
+    }
+
+    bool isInputValForwardOnly() const override {
+        return true;
+    }
+
+    bool isValForwardOnly() const override {
+        return true;
     }
 
 private:
@@ -94,8 +102,7 @@ public:
     }
 
     void init(Node &input, int row, const vector<int> &offsets, int col = 1) {
-        bool pool = col == 1;
-        allocateBatch(row * col, offsets.size(), pool);
+        allocateBatch(row * col, offsets.size());
         int i = 0;
         for (int offset : offsets) {
             SplitNode *s = dynamic_cast<SplitNode *>(batch().at(i++));
@@ -152,13 +159,13 @@ public:
 
         for (Node *node : batch) {
             SplitNode &split = dynamic_cast<SplitNode &>(*node);
-            inputs.push_back(split.getInput().getVal().value);
+            inputs.push_back(split.inputVal().value);
             offsets_.push_back(split.offset_);
             results.push_back(split.getVal().value);
             int col = split.getColumn();
             cols_.push_back(col);
             rows_.push_back(split.getDim() / col);
-            in_rows_.push_back(split.getInput().getDim() / col);
+            in_rows_.push_back(split.inputDim() / col);
         }
         cuda::SplitForward(inputs, offsets_, count, rows_, in_rows_, cols_, results);
 #if TEST_CUDA
@@ -173,19 +180,14 @@ public:
 
         for (Node *node : batch) {
             SplitNode *split = static_cast<SplitNode*>(node);
-            grads.push_back(split->getLoss().value);
-            input_grads.push_back(split->getInput().getLoss().value);
+            grads.push_back(split->getGrad().value);
+            input_grads.push_back(split->inputGrad().value);
         }
 
         cuda::SplitBackward(grads, offsets_, batch.size(), rows_, in_rows_, cols_,
                 input_grads);
 #if TEST_CUDA
-        auto get_inputs = [](Node &node) {
-            SplitNode &split = static_cast<SplitNode&>(node);
-            vector<pair<Node *, string>> inputs = {make_pair(&split.getInput(), "input")};
-            return inputs;
-        };
-        Executor::testBackward(get_inputs);
+        Executor::testBackward();
         cout << "split backward tested" << endl;
 #endif
     }
@@ -210,9 +212,7 @@ public:
 #endif
 
 Executor *SplitNode::generate() {
-    SplitExecutor * executor = new SplitExecutor;
-    executor->batch.push_back(this);
-    return executor;
+    return new SplitExecutor;
 }
 
 }

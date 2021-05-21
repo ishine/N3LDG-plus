@@ -9,10 +9,6 @@ class BucketNode : public Node, public Poolable<BucketNode> {
 public:
     BucketNode() : Node("bucket") {}
 
-    void initNode(int dim) override {
-        init(dim);
-    }
-
     void setNodeDim(int dim) override {
         setDim(dim);
     }
@@ -39,6 +35,15 @@ public:
 
     void setVals(const vector<dtype> &vals) {
         input_ = vals;
+    }
+
+protected:
+    int forwardOnlyInputValSize() override {
+        return 0;
+    }
+
+    bool isValForwardOnly() const override {
+        return true;
     }
 
 private:

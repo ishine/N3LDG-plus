@@ -2,6 +2,7 @@
 #define N3LDG_PLUS_OPERATOR_DEF_H
 
 #include "n3ldg-plus/base/def.h"
+#include <cmath>
 
 namespace n3ldg_plus {
 
@@ -17,7 +18,7 @@ inline dtype dequal(const dtype& x, const dtype& y) {
     return 1;
 }
 
-inline dtype dtanh(const dtype& x, const dtype& y) {
+inline dtype dtanh(dtype y) {
     return (1 + y) * (1 - y);
 }
 
@@ -33,17 +34,16 @@ inline dtype dselu(const dtype& x, const dtype& y) {
     return lambda;
 }
 
-inline dtype dsigmoid(const dtype& x, const dtype& y) {
+inline dtype dsigmoid(dtype y) {
     return (1 - y) * y;
-}
-
-inline dtype drelu(const dtype& x, const dtype& y) {
-    if (y <= 0) return 0;
-    return 1;
 }
 
 inline dtype dexp(const dtype& x, const dtype& y) {
     return y;
+}
+
+inline dtype drelu(dtype y) {
+    return y > 0 ? 1 : 0;
 }
 
 inline dtype dlog(const dtype& x, const dtype& y) {

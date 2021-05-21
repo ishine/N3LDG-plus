@@ -1,17 +1,16 @@
 #include "n3ldg-plus/operator/softmax.h"
 
-using ::std::string;
-using ::std::vector;
+using std::string;
+using std::vector;
+using std::cout;
+using std::cerr;
+using std::endl;
 
 namespace n3ldg_plus {
 
 class SoftmaxNode : public UniInputNode, public Poolable<SoftmaxNode> {
 public:
     SoftmaxNode() : UniInputNode("softmax") {}
-
-    void initNode(int dim) override {
-        init(dim);
-    }
 
     void setNodeDim(int dim) override {
         setDim(dim);
@@ -22,11 +21,11 @@ public:
     void compute() override {
         int row = getDim() / getColumn();
         for (int i = 0; i < getColumn(); ++i) {
-            dtype max = Mat(getInput().getVal().v + row * i, row, 1).maxCoeff();
+            dtype max = Mat(inputVal().v + row * i, row, 1).maxCoeff();
             Tensor1D x_exp, x;
             x.init(row);
             x_exp.init(row);
-            x.vec() = Vec(getInput().getVal().v + row * i, row) - max;
+            x.vec() = Vec(inputVal().v + row * i, row) - max;
             x_exp.vec() = x.vec().exp();
             dtype sum = x_exp.mat().sum();
             Vec(val().v + row * i, row) = x_exp.vec() / sum;
@@ -38,13 +37,13 @@ public:
         for (int i = 0; i < getColumn(); ++i) {
             Tensor1D a;
             a.init(row);
-            a.vec() = Vec(getLoss().v + i * row, row) * Vec(getVal().v + i * row, row);
+            a.vec() = Vec(getGrad().v + i * row, row) * Vec(getVal().v + i * row, row);
             dtype z = a.mat().sum();
             Tensor1D b;
             b.init(row);
             b.vec() = z - a.vec();
-            Vec(getInput().loss().v + i * row, row) += Vec(getVal().v + i * row, row) *
-                ((1 - Vec(getVal().v + i * row, row)) * Vec(getLoss().v + i * row, row) - b.vec());
+            Vec(inputGrad().v + i * row, row) += Vec(getVal().v + i * row, row) *
+                ((1 - Vec(getVal().v + i * row, row)) * Vec(getGrad().v + i * row, row) - b.vec());
         }
     }
 
@@ -55,6 +54,14 @@ public:
 protected:
     virtual bool isDimLegal(const Node &input) const override {
         return true;
+    }
+
+    bool isInputValForwardOnly() const override {
+        return true;
+    }
+
+    bool isValForwardOnly() const override {
+        return false;
     }
 };
 
@@ -71,11 +78,11 @@ public:
 };
 
 #if USE_GPU
-class SoftmaxExecutor : public UniInputExecutor {
+class SoftmaxExecutor : public Executor {
 public:
     void forward() override {
 #if TEST_CUDA
-        UniInputExecutor::testForwardInpputs();
+        Executor::testForwardInpputs();
 #endif
         int count = batch.size();
         vector<dtype *> in_vals(count);
@@ -88,7 +95,7 @@ public:
             vals_.push_back(s.getVal().value);
             rows_.push_back(s.getDim() / s.getColumn());
             cols_.push_back(s.getColumn());
-            in_vals.at(i++) = s.getInput().getVal().value;
+            in_vals.at(i++) = s.inputVal().value;
         }
         row_arr_.init(rows_.data(), count);
         col_arr_.init(cols_.data(), count);
@@ -99,15 +106,14 @@ public:
                 max_col_, val_arr_.value);
 #if TEST_CUDA
         try {
-            UniInputExecutor::testForward();
+            Executor::testForward();
         } catch (cuda::CudaVerificationException &e) {
             cerr << "softmax forward verification failed" << endl;
             SoftmaxNode &s = dynamic_cast<SoftmaxNode &>(*batch.at(e.getIndex()));
-            cerr << "input val:" << s.getInput().getVal().toString() << endl;
+            cerr << "input val:" << s.inputVal().toString() << endl;
             cerr << "gpu:" << endl;
-            s.getInput().getVal().print();
-            cout << boost::format("count:%1% dim:%2% col:%3%") % count % s.getDim() %
-                s.getColumn() << endl;
+            s.inputVal().print();
+            cout << fmt::format("count:{} dim:{} col:{}\n", count, s.getDim(), s.getColumn());
             abort();
         }
 #endif
@@ -123,15 +129,15 @@ public:
             SoftmaxNode &s = dynamic_cast<SoftmaxNode &>(*node);
             offsets.at(i) = dim_sum;
             dim_sum += s.getDim();
-            grads.at(i) = s.getLoss().value;
-            in_grads.at(i++) = s.getInput().getLoss().value;
+            grads.at(i) = s.getGrad().value;
+            in_grads.at(i++) = s.inputGrad().value;
         }
         cuda::IntArray offset_arr;
         offset_arr.init(offsets.data(), count);
         cuda::SoftmaxBackward(grads, val_arr_.value, count, row_arr_.value, max_row_,
-                col_arr_.value, max_col_, offset_arr.value, in_grads);
+                col_arr_.value, max_col_, offset_arr.value, dim_sum, in_grads);
 #if TEST_CUDA
-        UniInputExecutor::testBackward();
+        Executor::testBackward();
 #endif
     }
 
@@ -143,7 +149,7 @@ private:
     int max_row_, max_col_;
 };
 #else
-class SoftmaxExecutor : public UniInputExecutor {
+class SoftmaxExecutor : public Executor {
 public:
     int calculateFLOPs() override {
         return 0; // TODO
@@ -155,20 +161,30 @@ Executor *SoftmaxNode::generate() {
     return new SoftmaxExecutor;
 }
 
-Node* softmax(Node &input, int input_col) {
+Node* softmax(Node &input, int row) {
     using namespace n3ldg_plus;
-    bool pool = input_col == 1;
-    SoftmaxNode *node = SoftmaxNode::newNode(input.getDim(), pool);
-    node->setColumn(input_col);
+    SoftmaxNode *node = SoftmaxNode::newNode(input.getDim());
+    int col = input.getDim() / row;
+    if (col * row != input.getDim()) {
+        cerr << fmt::format("softmax - col:{} row:{} input dim:{}", col, row, input.getDim()) <<
+            endl;
+        abort();
+    }
+    node->setColumn(col);
     node->connect(input);
     return node;
 }
 
-BatchedNode* softmax(BatchedNode &input, int col) {
-    using namespace n3ldg_plus;
-    BatchedSoftmaxNode *node = new BatchedSoftmaxNode;
-    node->init(input, col);
-    return node;
+BatchedNode* softmax(BatchedNode &input, int row) {
+    BatchedSoftmaxNode *ret = new BatchedSoftmaxNode;
+    int col = input.getDim() / row;
+    if (col * row != input.getDim()) {
+        cerr << fmt::format("softmax - col:{} row:{} input dim:{}", col, row, input.getDim()) <<
+            endl;
+        abort();
+    }
+    ret->init(input, col);
+    return ret;
 }
 
 }

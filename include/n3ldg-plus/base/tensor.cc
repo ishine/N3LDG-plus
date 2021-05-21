@@ -2,9 +2,17 @@
 #include "eigen/Eigen/Dense"
 #include "fmt/core.h"
 #include "eigen/unsupported/Eigen/CXX11/Tensor"
+#if USE_GPU
+#include "n3ldg-plus/cuda/n3ldg_plus_cuda.h"
+#endif
+#include <map>
+#include "n3ldg-plus/util/profiler.h"
 
 using std::vector;
 using std::string;
+using std::map;
+using std::pair;
+using std::make_pair;
 using std::to_string;
 using std::cout;
 using std::cerr;
@@ -15,19 +23,58 @@ using std::normal_distribution;
 namespace n3ldg_plus {
 
 cpu::Tensor1D::~Tensor1D() {
-    if (v) {
-        delete[] v;
-    }
+    releaseMemory();
 }
 
 void cpu::Tensor1D::init(int ndim) {
+    if (v != nullptr) {
+        cerr << fmt::format("Tensor1D::init v is not null\n");
+        abort();
+    }
     dim = ndim;
     v = new dtype[dim];
-    zero();
+}
+
+void cpu::Tensor1D::init(int dimm, const std::shared_ptr<MemoryContainer> &container) {
+    dim = dimm;
+    v = static_cast<dtype *>(container->allocate(dimm * sizeof(dtype)));
+    memory_container_ = container;
+}
+
+void cpu::Tensor1D::retain() {
+    if (ref_count_ < 0) {
+        cerr << fmt::format("Tensor1D::retain ref_count_:{}\n", ref_count_);
+        abort();
+    }
+    ++ref_count_;
+}
+
+void cpu::Tensor1D::release() {
+    if (ref_count_ < 0) {
+        cerr << fmt::format("Tensor1D::release ref_count_:{}\n", ref_count_);
+        abort();
+    }
+    if (ref_count_ == 0) {
+        return;
+    }
+    if (--ref_count_ == 0) {
+        releaseMemory();
+    }
+}
+
+void cpu::Tensor1D::releaseMemory() {
+    if (v != nullptr) {
+        if (memory_container_ == nullptr) {
+            delete[] v;
+        } else {
+            memory_container_ = nullptr;
+        }
+        v = nullptr;
+    }
+    ref_count_ = 0;
 }
 
 void cpu::Tensor1D::zero() {
-    assert(v != NULL);
     for (int i = 0; i < dim; ++i) {
         v[i] = 0;
     }
@@ -36,7 +83,7 @@ void cpu::Tensor1D::zero() {
 string cpu::Tensor1D::toString() const {
     string result = fmt::format("dim:{} ", dim);
     for (int i = 0; i < dim; ++i) {
-        result += to_string(v[i]) + " ";
+        result += to_string(v[i]) + "\n";
     }
     return result;
 }
@@ -129,14 +176,14 @@ void cpu::Tensor1D::checkIsNumber() const {
 cpu::Tensor2D::Tensor2D() {
     col = row = 0;
     size = 0;
-    v = NULL;
+    v = nullptr;
 }
 
 cpu::Tensor2D::~Tensor2D() {
     if (v) {
         delete[] v;
     }
-    v = NULL;
+    v = nullptr;
     col = row = 0;
     size = 0;
 }
@@ -145,12 +192,16 @@ void cpu::Tensor2D::init(int nrow, int ncol) {
     row = nrow;
     col = ncol;
     size = col * row;
+    if (v != nullptr) {
+        cerr << "cpu::Tensor2D::init v is not nullptr" << endl;
+        abort();
+    }
     v = new dtype[size];
     zero();
 }
 
 void cpu::Tensor2D::zero() {
-    assert(v != NULL);
+    assert(v != nullptr);
     for (int i = 0; i < size; ++i) {
         v[i] = 0;
     }
@@ -253,6 +304,74 @@ void cpu::Tensor2D::norm2one(dtype norm) {
     }
 }
 
+void initAndZeroTensors(vector<cpu::Tensor1D *> &tensors, const vector<int> &dims,
+        const vector<string> &signatures) {
+    if (tensors.size() != dims.size()) {
+        cerr << fmt::format("initAndZeroTensors - tensor size:{} dim size:{}", tensors.size(),
+                dims.size()) << endl;
+        abort();
+    }
+
+    Profiler &profiler = Profiler::Ins();
+    profiler.BeginEvent("memory_management");
+
+    map<string, map<cpu::Tensor1D *, int>> tensor_map;
+    for (int i = 0; i < tensors.size(); ++i) {
+        const string &sig = signatures.at(i);
+        const auto &it = tensor_map.find(sig);
+        cpu::Tensor1D &tensor = *tensors.at(i);
+        int dim = dims.at(i);
+        if (it == tensor_map.end()) {
+            map<cpu::Tensor1D*, int> m;
+            m.insert(make_pair(&tensor, dim));
+            auto q = make_pair(sig, m);
+            tensor_map.insert(q);
+        } else {
+            const auto &it2 = it->second.find(&tensor);
+            if (it2 == it->second.end()) {
+                it->second.insert(make_pair(&tensor, dim));
+            }
+        }
+    }
+
+    vector<cpu::Tensor1D *> unique_tesnors;
+    unique_tesnors.reserve(tensors.size());
+    vector<int> unique_dims;
+    unique_dims.reserve(dims.size());
+
+    for (const auto &it : tensor_map) {
+        int sum = 0;
+        for (const auto &it2 : it.second) {
+            sum += it2.second;
+        }
+        auto container = memoryContainer(sum * sizeof(dtype));
+        for (const auto &it2 : it.second) {
+            cpu::Tensor1D &tensor = *it2.first;
+            tensor.init(it2.second, container);
+            unique_tesnors.push_back(&tensor);
+            unique_dims.push_back(it2.second);
+        }
+    }
+    profiler.EndEvent();
+
+    profiler.BeginEvent("clear_grad");
+
+#if USE_GPU
+    vector<dtype *> grads;
+    grads.reserve(unique_tesnors.size());
+    for (cpu::Tensor1D *tensor : unique_tesnors) {
+        cuda::Tensor1D &gpu_tensor = dynamic_cast<cuda::Tensor1D &>(*tensor);
+        grads.push_back(gpu_tensor.value);
+    }
+    cuda::BatchMemset(grads, grads.size(), unique_dims, 0.0f);
+#else
+    for (cpu::Tensor1D *tensor : unique_tesnors) {
+        tensor->zero();
+    }
+#endif
+    profiler.EndCudaEvent();
+}
+
 #if USE_GPU
 
 cuda::Tensor1D::Tensor1D() = default;
@@ -301,8 +420,8 @@ string cuda::Tensor2D::name() const {
 }
 
 void cuda::Tensor2D::zero() {
-    assert(v != NULL);
-    if (v == NULL) {
+    assert(v != nullptr);
+    if (v == nullptr) {
         cerr << "tensor2d v is null" << endl;
         abort();
     }

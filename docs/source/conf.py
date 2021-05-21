@@ -10,14 +10,24 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
-# import os
-# import sys
-# sys.path.insert(0, os.path.abspath('.'))
+import os
+import sys
+import subprocess
+sys.path.insert(0, os.path.abspath('.'))
 
+subprocess.call('cd ../doxygen; doxygen', shell=True)
 
+# -- General configuration ------------------------------------------------
+
+# If your documentation needs a minimal Sphinx version, state it here.
+#needs_sphinx = '1.0'
+
+# Add any Sphinx extension module names here, as strings. They can be
+# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
+# ones.
 # -- Project information -----------------------------------------------------
 
-project = 'N3LDG++'
+project = "N3LDG++"
 copyright = '2021, Chauncey Wang'
 author = 'Chauncey Wang'
 
@@ -34,7 +44,15 @@ html_logo = "images/logo_transparent.png"
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
+    'sphinx.ext.mathjax',
+    'sphinx.ext.todo',
+    'breathe',
+    'nbsphinx',
+    'sphinx.ext.autodoc',
 ]
+breathe_projects = {"N3LDG++": "../doxygen/xml/"}
+breathe_default_project = "N3LDG++"
+
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']

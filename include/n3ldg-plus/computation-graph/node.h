@@ -5,6 +5,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <memory>
 #include <iostream>
 #include "fmt/core.h"
 #include "n3ldg-plus/base/tensor.h"
@@ -47,11 +48,11 @@ public:
     virtual std::string typeSignature() const = 0;
     virtual int getDim() const = 0;
 
-    virtual std::string getNodeType() const {
+    virtual const std::string &getNodeType() const {
         return node_type_;
     }
 
-    std::string cachedTypeSig() const;
+    const std::string &cachedTypeSig() const;
 
     virtual void clear();
 
@@ -128,16 +129,20 @@ public:
         return val_;
     }
 
-    const Tensor1D &getLoss() const {
-        return loss_;
+    const Tensor1D &getGrad() const {
+        return grad_;
     }
 
-    Tensor1D &loss() {
-        return loss_;
+    Tensor1D &grad() {
+        return grad_;
     }
 
     int getDim() const override {
         return dim_;
+    }
+
+    int getId() const {
+        return id_;
     }
 
     virtual void clear() override;
@@ -155,11 +160,11 @@ public:
     }
 
     Mat valMat() {
-        return Mat(val().v, getRow(), column_);
+        return Mat(val_.v, getRow(), column_);
     }
 
     Mat gradMat() {
-        return Mat(loss().v, getRow(), column_);
+        return Mat(grad_.v, getRow(), column_);
     }
 
     void setColumn(int column);
@@ -184,7 +189,29 @@ public:
         is_pooled_ = is_pooled;
     }
 
-    virtual void setInputs(const std::vector<Node*> &inputs) {}
+    virtual void setInputs(const std::vector<Node*> &inputs);
+
+    void clearInputVals(bool force);
+
+    void clearVal(bool force);
+
+    void clearGrad();
+
+    int inputSize() const {
+        return input_dims_.size();
+    }
+
+    std::vector<Tensor1D *> &inputVals() {
+        return input_vals_;
+    }
+
+    const std::vector<const std::string *> &inputTypes() const {
+        return input_types_;
+    }
+
+    const std::vector<int> &inputIds() const {
+        return input_ids_;
+    }
 
 protected:
     void afterConnect(const std::vector<Node*> &ins);
@@ -193,19 +220,28 @@ protected:
 
     Node(const std::string &node_type, int dim = 0);
 
-    virtual void setDim(int dim) {
-        dim_ = dim;
-    }
+    virtual void setDim(int dim);
 
-    virtual void init(int ndim);
+    virtual bool isValForwardOnly() const = 0;
+
+    virtual int forwardOnlyInputValSize() = 0;
+
+    std::vector<Tensor1D *> input_vals_;
+    std::vector<Tensor1D *> input_grads_;
+    std::vector<int> input_dims_;
+    std::vector<const std::string *> input_types_;
+    std::vector<int> input_ids_;
 
 private:
     Tensor1D val_;
-    Tensor1D loss_;
+    Tensor1D grad_;
     int dim_;
     int column_ = 1;
     NodeAbs *batched_node_;
     bool is_pooled_ = true;
+    int id_ = 0;
+
+    friend class Executor;
 };
 
 class BatchedNode : public NodeAbs {
@@ -236,7 +272,7 @@ public:
 
     std::string shape() const;
 
-    virtual std::string getNodeType() const override;
+    virtual const std::string &getNodeType() const override;
 
     std::vector<Node *> &batch() override {
         return batch_;
@@ -260,6 +296,7 @@ protected:
 private:
     std::vector<Node *> batch_;
     mutable std::vector<int> *dims_ = nullptr;
+    mutable std::string node_type_;
 };
 
 template<typename NodeType>
@@ -268,12 +305,12 @@ public:
     BatchedNodeImpl() = default;
 
 protected:
-    void allocateBatch(int dim, int size, bool pool = true) {
+    void allocateBatch(int dim, int size) {
         if (!batch().empty()) {
             std::cerr << "batch not empty" << std::endl;
             abort();
         }
-        auto v = NodeType::newNodeVector(dim, size, pool);
+        auto v = NodeType::newNodeVector(dim, size);
         batch().reserve(v.size());
         for (auto *x : v) {
             x->setBatchedNode(this);
@@ -281,7 +318,7 @@ protected:
         }
     }
 
-    void allocateBatch(const std::vector<int> &dims, bool pool = true) {
+    void allocateBatch(const std::vector<int> &dims) {
         if (!batch().empty()) {
             std::cerr << "batch not empty" << std::endl;
             abort();
@@ -289,17 +326,16 @@ protected:
 
         batch().reserve(dims.size());
         for (int dim : dims) {
-            auto node = NodeType::newNode(dim, pool);
+            auto node = NodeType::newNode(dim);
             node->setBatchedNode(this);
-            node->setIsPooled(pool);
             batch().push_back(node);
         }
     }
 };
 
 
-inline std::set<std::pair<std::vector<Node *>, int> *>& globalPoolReferences() {
-    static std::set<std::pair<std::vector<Node *>, int> *> o;
+inline std::map<std::vector<Node *> *, int *> &globalPoolReferences() {
+    static std::map<std::vector<Node *> *, int *> o;
     return o;
 }
 
@@ -321,133 +357,100 @@ inline int NextTwoIntegerPowerNumber(int number) {
     return result;
 }
 
-constexpr int BIG_VECTOR_SIZE = 1024 * 16;
-
 template <typename T>
 class Poolable {
 public:
-    static std::vector<T *> newNodeVector(int key, int size, bool pool = true) {
+    static std::vector<T *> newNodeVector(int key, int size) {
         if (key <= 0) {
             std::cerr << "newNode key:" << key << std::endl;
             abort();
         }
         std::vector<T *> results(size);
-        if (!globalPoolEnabled() || (!pool && key >= BIG_VECTOR_SIZE)) {
+        if (!globalPoolEnabled()) {
             for (int i = 0; i < size; ++i) {
                 T *node = new T;
-                node->initNode(key);
+                node->setNodeDim(key);
                 node->setIsPooled(false);
                 results.at(i) = node;
             }
             return results;
         }
 
-        int original_key = key;
-        if (globalLimitedDimEnabled()) {
-            key = NextTwoIntegerPowerNumber(key);
+        if (pool_.empty()) {
+            globalPoolReferences().insert(std::make_pair(&pool_, &used_count_));
         }
 
-        auto it = pool_.find(key);
-        if (it == pool_.end()) {
-            pool_.insert(make_pair(key, make_pair(std::vector<Node *>(), 0)));
-            it = pool_.find(key);
-            globalPoolReferences().insert(&it->second);
-        }
-        auto &p = it->second;
-        std::vector<Node *> &v = p.first;
-        if (p.second > v.size()) {
+        if (used_count_ > pool_.size()) {
             abort();
-        } else if (v.size() < p.second + size) {
-            int vsize = v.size();
-            for (int i = 0; i < p.second + size - vsize; ++i) {
+        } else if (pool_.size() < used_count_ + size) {
+            int vsize = pool_.size();
+            for (int i = 0; i < used_count_ + size - vsize; ++i) {
                 T *node = new T;
-                node->initNode(key);
-                v.push_back(node);
+                pool_.push_back(node);
             }
         }
 
         std::vector<T *> nodes(size);
         nodes.reserve(size);
         for (int i = 0; i < size; ++i) {
-            T *node = dynamic_cast<T*>(v.at(p.second + i));
-            node->setNodeDim(original_key);
+            T *node = dynamic_cast<T*>(pool_.at(used_count_ + i));
+            node->setNodeDim(key);
             static_cast<Node *>(node)->clear();
             nodes.at(i) = node;
         }
 
-        p.second += size;
+        used_count_ += size;
 
         return nodes;
     }
 
-    static T *newNode(int key, bool pool = true) {
+    static T *newNode(int key) {
         if (key <= 0) {
             std::cerr << "newNode key:" << key << std::endl;
             abort();
         }
-        if (!globalPoolEnabled() || (!pool && key >= BIG_VECTOR_SIZE)) {
+        if (!globalPoolEnabled()) {
             T *node = new T;
-            node->initNode(key);
             node->setIsPooled(false);
             node->setNodeDim(key);
             node->setBatchedNode(node);
             return node;
         }
-        int original_key = key;
-        if (globalLimitedDimEnabled()) {
-            key = NextTwoIntegerPowerNumber(key);
+
+        if (pool_.empty()) {
+            globalPoolReferences().insert(std::make_pair(&pool_, &used_count_));
         }
 
-        std::map<int, std::pair<std::vector<Node *>, int>>::iterator it;
-        if (last_key_ == key) {
-            it = last_it_;
-        } else {
-            it = pool_.find(key);
-            if (it == pool_.end()) {
-                pool_.insert(make_pair(key, make_pair(std::vector<Node *>(), 0)));
-                it = pool_.find(key);
-                globalPoolReferences().insert(&it->second);
-            }
-            last_it_ = it;
-            last_key_ = key;
-        }
-        auto &p = it->second;
-        std::vector<Node *> &v = p.first;
         T *node;
-        if (p.second > v.size()) {
+        if (used_count_ > pool_.size()) {
             abort();
-        } else if (v.size() == p.second) {
+        } else if (pool_.size() == used_count_) {
             node = new T;
-            node->initNode(key);
-            node->setNodeDim(original_key);
+            node->setNodeDim(key);
             node->setBatchedNode(node);
-            v.push_back(node);
-            ++p.second;
+            pool_.push_back(node);
+            ++used_count_;
         } else {
-            node = dynamic_cast<T*>(v.at(p.second));
-            node->setNodeDim(original_key);
+            node = dynamic_cast<T*>(pool_.at(used_count_));
             node->clear();
+            node->setNodeDim(key);
             node->setBatchedNode(node);
-            ++p.second;
+            ++used_count_;
         }
         return node;
     }
 
-    virtual void initNode(int dim) = 0;
     virtual void setNodeDim(int dim) = 0;
 
 private:
-    static std::map<int, std::pair<std::vector<Node *>, int>> pool_;
-    static std::map<int, std::pair<std::vector<Node *>, int>>::iterator last_it_;
-    static int last_key_;
+    static std::vector<Node *> pool_;
+    static int used_count_;
 };
 
 template<typename T>
-std::map<int, std::pair<std::vector<Node *>, int>> Poolable<T>::pool_;
+std::vector<Node *> Poolable<T>::pool_;
 template<typename T>
-std::map<int, std::pair<std::vector<Node *>, int>>::iterator Poolable<T>::last_it_;
-template<typename T>
-int Poolable<T>::last_key_;
+int Poolable<T>::used_count_ = 0;
 
 void validateEqualNodeDims(const std::vector<Node *> &nodes);
 
@@ -457,21 +460,32 @@ public:
 
     virtual std::string typeSignature() const override;
 
-    virtual void setInputs(const std::vector<Node *> &ins) override {
-        input_ = ins.front();
-    }
-
     void connect(Node &input);
 
-    Node &getInput() const {
-        return *input_;
+    Tensor1D &inputVal() {
+        return *input_vals_.front();
+    }
+
+    Tensor1D &getInputVal() const {
+        return *input_vals_.front();
+    }
+
+    Tensor1D &inputGrad() {
+        return *input_grads_.front();
+    }
+
+    int inputDim() const {
+        return input_dims_.front();
     }
 
 protected:
     virtual bool isDimLegal(const Node &input) const = 0;
 
+    virtual bool isInputValForwardOnly() const = 0;
+
+    virtual int forwardOnlyInputValSize() override;
+
 private:
-    Node *input_;
     friend class UniInputExecutor;
 };
 
@@ -485,9 +499,7 @@ std::vector<Node*> toNodePointers(const std::vector<T *> &vec) {
     return results;
 }
 
-#if USE_GPU
-void clearNodes(std::vector<Node*> &nodes);
-#endif
+void initAndZeroGrads(std::vector<Node*> &nodes);
 
 class Executor {
 public:
@@ -514,7 +526,7 @@ public:
         return node.getDim() / node.getColumn();
     }
 
-    std::string getNodeType() const {
+    const std::string &getNodeType() const {
         return batch.front()->getNodeType();
     }
 
@@ -528,9 +540,7 @@ public:
 
     void forwardFully();
 
-    void backwardFully() {
-        backward();
-    }
+    void backwardFully();
 
     virtual void backward();
 
@@ -544,28 +554,13 @@ protected:
 
     void verifyForward();
 
-    void testForwardInpputs(const function<vector<Node*>(Node &node)> &get_inputs);
-
-    void testForwardInpputs(const function<vector<pair<Node*, string>>(Node &node)> &get_inputs);
-
-    void verifyBackward(const function<vector<pair<Node*, string>>(Node &node)> &get_inputs);
-
-    void testBackward(const function<vector<pair<Node*, string>>(Node &node)> &get_inputs);
-
-    void testBeforeBackward(const function<vector<pair<Node*, string>>(Node &node)> &get_inputs);
-#endif
-};
-
-class UniInputExecutor : public Executor {
-protected:
-#if TEST_CUDA
     void testForwardInpputs();
-
-    void testBeforeBackward();
 
     void verifyBackward();
 
     void testBackward();
+
+    void testBeforeBackward();
 #endif
 };
 

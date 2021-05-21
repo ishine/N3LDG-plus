@@ -19,10 +19,6 @@ public:
         setDim(dim);
     }
 
-    void initNode(int dim) override {
-        init(dim);
-    }
-
     void setParam(Embedding<ParamType>& param) {
         param_ = param;
     }
@@ -57,13 +53,22 @@ public:
             int dim = getDim() / ids_.size();
             int i = 0;
             for (int id : ids_) {
-                Vec(param_->grad()[id], dim) += Vec(loss().v + i++ * dim, dim);
+                Vec(param_->grad()[id], dim) += Vec(grad().v + i++ * dim, dim);
             }
         }
     }
 
     void setShouldBackward(bool should_backward) {
         should_backward_ = should_backward;
+    }
+
+protected:
+    int forwardOnlyInputValSize() override {
+        return {};
+    }
+
+    bool isValForwardOnly() const override {
+        return true;
     }
 
 private:
@@ -78,9 +83,8 @@ private:
 template <typename ParamType>
 Node *embedding(Graph &graph, const vector<int> &ids, ParamType &lookup,
         bool should_backward = true) {
-    bool pool = ids.size() == 1;
     LookupNode<ParamType>* input_lookup =
-        LookupNode<ParamType>::newNode(lookup.outDim() * ids.size(), pool);
+        LookupNode<ParamType>::newNode(lookup.outDim() * ids.size());
     input_lookup->setShouldBackward(should_backward);
     input_lookup->setParam(lookup);
     input_lookup->connect(graph, ids);
@@ -186,11 +190,13 @@ public:
             return;
         }
 
+        param().initAndZeroGrad();
+
         int count = batch.size();
         vector<dtype*> grads;
         grads.reserve(count);
         for (Node *n : batch) {
-            grads.push_back(n->loss().value);
+            grads.push_back(n->grad().value);
         }
         genericBackward(grads);
 #if TEST_CUDA
@@ -198,7 +204,7 @@ public:
             batch[idx]->backward();
         }
 
-        cuda::Assert(param().grad.verify("lookup backward grad"));
+        cuda::Assert(param().grad().verify("lookup backward grad"));
 #endif
     }
 
@@ -238,6 +244,15 @@ public:
 
     int calculateActivations() override {
         return 0;
+    }
+
+    void backward() override {
+        param().initAndZeroGrad();
+        Executor::backward();
+    }
+
+    ParamType &param() {
+        return *dynamic_cast<LookupNode<ParamType> &>(*batch.front()).param_;
     }
 };
 #endif

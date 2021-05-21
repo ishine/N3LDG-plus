@@ -3,16 +3,23 @@
 using std::string;
 using std::vector;
 using std::cerr;
+using std::cout;
+using std::endl;
+using std::pair;
+using std::make_pair;
 
 namespace n3ldg_plus {
+
+namespace {
+
+const int NUMERATOR = 0;
+const int DENOMINATOR = 1;
+
+}
 
 class FullDivNode : public Node, public Poolable<FullDivNode>  {
 public:
     FullDivNode() : Node("full_div") {}
-
-    void initNode(int dim) override {
-        init(dim);
-    }
 
     void setNodeDim(int dim) override {
         setDim(dim);
@@ -28,8 +35,8 @@ public:
                 inputs.at(0)->getDim(), inputs.at(1)->getDim());
             abort();
         }
-        numerator_ = inputs.at(0);
-        denominator_ = inputs.at(1);
+
+        Node::setInputs(inputs);
     }
 
     void connect(Node &numerator, Node &denominator) {
@@ -39,20 +46,27 @@ public:
     }
 
     void compute() override {
-        val().vec() = numerator_->getVal().vec() / denominator_->getVal().vec();
+        val().vec() = input_vals_.at(NUMERATOR)->vec() / input_vals_.at(DENOMINATOR)->vec();
     }
 
     void backward() override {
-        numerator_->loss().vec() += getLoss().vec() / denominator_->getVal().vec();
-        denominator_->loss().vec() -= getLoss().vec() * numerator_->getVal().vec() /
-            denominator_->getVal().vec().square();
+        input_grads_.at(NUMERATOR)->vec() += getGrad().vec() / input_vals_.at(DENOMINATOR)->vec();
+        input_grads_.at(DENOMINATOR)->vec() -= getGrad().vec() * input_vals_.at(NUMERATOR)->vec() /
+            input_vals_.at(DENOMINATOR)->vec().square();
     }
 
     Executor* generate() override;
 
+protected:
+    int forwardOnlyInputValSize() override {
+        return 0;
+    }
+
+    bool isValForwardOnly() const override {
+        return true;
+    }
+
 private:
-    Node *numerator_;
-    Node *denominator_;
     friend class FullDivExecutor;
 };
 
@@ -69,10 +83,6 @@ public:
 #if USE_GPU
 class FullDivExecutor : public Executor {
 public:
-    vector<dtype*> numerators;
-    vector<dtype*> denominators;
-    vector<int> dims;
-
     void forward() override {
         vector<dtype*> results;
         results.reserve(batch.size());
@@ -81,8 +91,8 @@ public:
         dims.reserve(batch.size());
         for (Node *node : batch) {
             FullDivNode *div = dynamic_cast<FullDivNode*>(node);
-            numerators.push_back(div->numerator_->getVal().value);
-            denominators.push_back(div->denominator_->getVal().value);
+            numerators.push_back(div->input_vals_.at(NUMERATOR)->value);
+            denominators.push_back(div->input_vals_.at(DENOMINATOR)->value);
             results.push_back(div->getVal().value);
             dims.push_back(node->getDim());
         }
@@ -102,24 +112,23 @@ public:
         denominator_losses.reserve(batch.size());
         for (Node *node : batch) {
             FullDivNode *div = dynamic_cast<FullDivNode*>(node);
-            losses.push_back(node->getLoss().value);
-            numerator_losses.push_back(div->numerator_->getLoss().value);
-            denominator_losses.push_back(div->denominator_->getLoss().value);
+            losses.push_back(node->getGrad().value);
+            numerator_losses.push_back(div->input_grads_.at(NUMERATOR)->value);
+            denominator_losses.push_back(div->input_grads_.at(DENOMINATOR)->value);
         }
 
         cuda::FullDivBackward(losses, denominators, numerators, batch.size(), dims,
                 numerator_losses, denominator_losses);
 #if TEST_CUDA
-        auto get_inputs = [](Node &node) {
-            FullDivNode &div = dynamic_cast<FullDivNode&>(node);
-            vector<pair<Node*, string>> results = {make_pair(div.denominator_, "denominator"),
-                    make_pair(div.numerator_, "numerator")};
-            return results;
-        };
-        Executor::testBackward(get_inputs);
+        Executor::testBackward();
         cout << "div backward tested" << endl;
 #endif
     }
+
+private:
+    vector<dtype*> numerators;
+    vector<dtype*> denominators;
+    vector<int> dims;
 };
 #else
 class FullDivExecutor : public Executor {
